@@ -1,0 +1,170 @@
+import yaml
+import os
+import re
+import csv
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+
+def export_network_security_policies_to_csv(yaml_dir):
+    """Exports Network Security Policies, namespaces, and CNI plugin to CSV."""
+    network_policies = {}
+    pods = {}
+    cni_plugin = None
+    namespaces_with_policy = set()
+    namespaces_without_policy = set()
+    policy_data = []
+    tls_data = []
+
+    for root, _, files in os.walk(yaml_dir):
+        for filename in files:
+            if filename.endswith((".yaml", ".yml")):
+                filepath = os.path.join(root, filename)
+                try:
+                    with open(filepath, "r") as f:
+                        resources = yaml.safe_load(f)
+
+                        if resources is None:
+                            print(f"Warning: File {filename} is empty or contains invalid YAML.")
+                            continue
+
+                        if isinstance(resources, dict) and resources.get("kind") == "List":
+                            items = resources.get("items", [])
+                        elif isinstance(resources, dict):
+                            items = [resources]
+                        else:
+                            print(f"Warning: File {filename} does not seem to contain valid Kubernetes resources.")
+                            continue
+
+                        for item in items:
+                            if cni_plugin is None:
+                                plugin = detect_cni_plugin(item)
+                                if plugin:
+                                    cni_plugin = plugin
+                                    print(f"Detected CNI plugin: {cni_plugin}")
+
+                            if item.get("kind") == "NetworkPolicy":
+                                np_name = item["metadata"]["name"]
+                                ns = item["metadata"]["namespace"]
+                                network_policies[f"{ns}/{np_name}"] = item["spec"]
+                                policy_data.append({
+                                    'namespace': ns,
+                                    'policy_name': np_name,
+                                    'policy_content': item,
+                                    'ingress_rules': item["spec"].get("ingress", [])
+                                })
+                                namespaces_with_policy.add(ns)
+                            elif item.get("kind") == "Pod":
+                                pod_name = item["metadata"]["name"]
+                                ns = item["metadata"]["namespace"]
+                                labels = item["metadata"].get("labels", {})
+                                pods[f"{ns}/{pod_name}"] = labels
+                                namespaces_without_policy.add(ns)
+                            elif item.get("kind") == "Ingress":
+                                ingress_name = item["metadata"]["name"]
+                                ns = item["metadata"]["namespace"]
+                                tls_config = item.get("spec", {}).get("tls", [])
+                                tls_data.append({
+                                    'namespace': ns,
+                                    'ingress_name': ingress_name,
+                                    'tls_config': tls_config
+                                    })
+                            elif item.get("kind") == "Secret":
+                                secret_name = item["metadata"]["name"]
+                                ns = item["metadata"]["namespace"]
+                                secret_type = item.get("type", "")
+                                if secret_type == "kubernetes.io/tls":
+                                    tls_data.append({
+                                        'namespace': ns,
+                                        'secret_name': secret_name,
+                                        'secret_type': secret_type
+                                    })
+                except yaml.YAMLError as e:
+                    print(f"Error parsing YAML in {filename}: {e}")
+                except Exception as e:
+                    print(f"An unexpected error occurred processing {filename}: {e}")
+
+    # Check for namespaces with no NetworkPolicy
+    for ns in set(pods.keys()).union(set(np.split("/")[0] for np in network_policies.keys())):
+        has_policy = False
+        for np_key in network_policies:
+            if np_key.startswith(ns + "/"):
+                has_policy = True
+                break
+        if not has_policy:
+            namespaces_without_policy.add(ns)
+
+    if cni_plugin is None:
+        print("Warning: No CNI plugin detected.")
+    else:
+        print(f"Detected CNI plugin: {cni_plugin}")
+            
+    export_policy_to_csv(policy_data, "network_policy_data.csv", cni_plugin, namespaces_with_policy, namespaces_without_policy)
+    print("Network policy data exported to network_policy_data.csv")
+    export_tls_to_csv(tls_data, "tls_data.csv")
+    print("TLS configuration data exported to tls_data.csv")
+
+def detect_cni_plugin(item):
+    """Detects the CNI plugin being used by examining the resources."""
+
+    if item.get("kind") == "DaemonSet" and item.get("metadata", {}).get("namespace") == "kube-system":
+        if item.get("spec", {}).get("template", {}).get("spec", {}).get("containers"):
+           for container in item["spec"]["template"]["spec"]["containers"]:
+               if container.get("name") == "cilium-agent":
+                   return "cilium"
+               if container.get("name") == "calico-node":
+                   return "calico"
+               if container.get("name") == "aws-node":
+                   return "aws-vpc-cni"
+               if container.get("name") == "weave-net":
+                   return "weave-net"
+               if container.get("name") == "flanneld":
+                   return "flannel"
+
+    if item.get("kind") == "ConfigMap" and item.get("metadata", {}).get("namespace") == "kube-system":
+        if item.get("metadata", {}).get("name") == "kube-proxy":
+            return "kube-proxy"
+        if item.get("metadata", {}).get("name") == "aws-vpc-cni":
+            return "aws-vpc-cni"
+        if item.get("metadata", {}).get("name") == "flannel-cni":
+            return "flannel"
+    
+    if item.get("kind") == "Pod" and item.get("metadata",{}).get("namespace") == "kube-system":
+            if item.get("metadata", {}).get("name", "").startswith("anetd"):
+                  return "cilium"
+            if item.get("metadata", {}).get("name", "").startswith("flannel"):
+                  return "flannel"
+            
+
+    return None  # No CNI plugin detected
+
+def export_policy_to_csv(policy_data, filename, cni_plugin, namespaces_with_policy, namespaces_without_policy):
+     """Exports policy data, CNI plugin, and namespaces to a CSV file."""
+     with open(filename, 'w', newline='') as csvfile:
+        fieldnames = ['cni_plugin', 'namespace', 'policy_name', 'policy_content', 'ingress_rules', 'has_policy', 'namespaces']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in policy_data:
+             writer.writerow({**row, "cni_plugin": cni_plugin, 'has_policy': True, 'namespaces': ','.join(namespaces_with_policy) })
+
+        writer.writerow({ 'namespace': '', 'policy_name': '', 'policy_content': '', 'ingress_rules': '', 'cni_plugin': cni_plugin, 'has_policy': False, 'namespaces': ','.join(namespaces_without_policy) })
+
+def export_tls_to_csv(tls_data, filename):
+    """Exports TLS configuration to a CSV file."""
+    with open(filename, 'w', newline='') as csvfile:
+        fieldnames = ['namespace', 'resource_type', 'resource_name', 'tls_config']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in tls_data:
+             if 'secret_name' in row:
+                writer.writerow({'namespace': row['namespace'], 'resource_type': 'Secret', 'resource_name': row['secret_name'], 'tls_config': row.get('secret_type', '')})
+             elif 'ingress_name' in row:
+                 writer.writerow({'namespace': row['namespace'], 'resource_type': 'Ingress', 'resource_name': row['ingress_name'], 'tls_config': str(row.get('tls_config', ''))})
+
+
+if __name__ == "__main__":
+    yaml_directory = input("Enter the path to the YAML folder: ")
+    if not os.path.isdir(yaml_directory):
+        print("Invalid directory path.")
+    else:
+       export_network_security_policies_to_csv(yaml_directory)
