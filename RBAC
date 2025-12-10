@@ -1,0 +1,287 @@
+import json
+import csv
+import os
+import yaml
+
+# Configuration for high-risk resources and verbs
+HIGH_RISK_RESOURCES = [
+    "secrets", "configmaps", "clusterroles", "clusterrolebindings",
+    "roles", "rolebindings", "nodes", "serviceaccounts"
+]
+HIGH_RISK_VERBS = ["create", "delete", "update", "patch", "impersonate", "bind", "escalate"]
+
+
+def audit_rbac_files(input_dir_json, input_dir_yaml, output_csv_file):
+    """
+    Audits ClusterRoles, ClusterRoleBindings, Roles, and RoleBindings,
+    performing API group analysis and resource-specific checks, and exports
+    relevant security information to a CSV file.  Takes separate JSON
+    and YAML directories as input.
+    """
+    try:
+        clusterroles = {}
+        clusterrolebindings = {}
+        namespaces = {}
+
+        # Load ClusterRole data (JSON)
+        for root, _, files in os.walk(input_dir_json):
+            for filename in files:
+                if filename.startswith("clusterroles.") and filename.endswith(".json"):
+                    filepath = os.path.join(root, filename)
+                    load_rbac_data_json(filepath, clusterroles, "ClusterRole")
+
+        # Load ClusterRoleBinding data (JSON)
+        for root, _, files in os.walk(input_dir_json):
+            for filename in files:
+                if filename.startswith("clusterrolebindings.") and filename.endswith(".json"):
+                    filepath = os.path.join(root, filename)
+                    load_rbac_data_json(filepath, clusterrolebindings, "ClusterRoleBinding")
+
+        # Load Namespace data (JSON) - still needed for ClusterRoleBinding checks
+        for root, _, files in os.walk(input_dir_json):
+            for filename in files:
+                if filename.startswith("namespaces.") and filename.endswith(".json"):
+                    filepath = os.path.join(root, filename)
+                    load_rbac_data_json(filepath, namespaces, "Namespace")
+
+        # Load Roles and RoleBindings (YAML)
+        roles = {}
+        rolebindings = {}
+        if input_dir_yaml:  # Check that it exists
+            load_namespaced_rbac_data_yaml(input_dir_yaml, roles, rolebindings)
+
+        # --- Summary Printing ---
+        print("\n--- RBAC Summary ---")
+
+        print("\nClusterRoles:")
+        for role_name in clusterroles:
+            print(f"  - {role_name}")
+
+        print("\nClusterRoleBindings:")
+        for binding_name in clusterrolebindings:
+            print(f"  - {binding_name}")
+
+        print("\nNamespaced Roles and Bindings:")
+        for namespace, namespace_roles in roles.items():
+            print(f"  Namespace: {namespace}")
+            print(f"    Roles:")
+            for role_name in namespace_roles:
+                print(f"      - {role_name}")
+            print(f"    RoleBindings:")
+            if namespace in rolebindings:  # Check if bindings exist for the namespace
+                for binding_name in rolebindings[namespace]:
+                    print(f"      - {binding_name}")
+            else:
+                print("      - None")  # Indicate no bindings found
+        print("--- End RBAC Summary ---\n")
+        # --- End Summary Printing ---
+
+        # Prepare CSV data
+        csv_data = []
+        headers = [
+            "Role Type", "Role Name", "Subject Type", "Subject Name", "Namespace Context",
+            "Namespace Name", "API Group", "Permission", "Resource", "High Risk"
+        ]
+        csv_data.append(headers)
+
+        # Process ClusterRoles and ClusterRoleBindings
+        for role_name, role_data in clusterroles.items():
+            process_clusterrole(role_data, clusterrolebindings, namespaces, csv_data)
+
+        # Process Roles and RoleBindings
+        for namespace, namespace_roles in roles.items():
+            for role_name, role_data in namespace_roles.items():
+                process_role(role_data, rolebindings.get(namespace, {}), csv_data, namespace)
+
+        # Write data to CSV
+        with open(output_csv_file, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerows(csv_data)
+
+        print(f"RBAC data exported to {output_csv_file}")
+
+    except FileNotFoundError:
+        print(f"Error: Directory not found.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+
+def load_rbac_data_json(filepath, data_store, kind):
+    """Loads RBAC data from a JSON file into the provided data store."""
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+            for item in data.get("items", []):  # Handle "List" kind files
+                if item.get("kind") == kind:
+                    name = item.get("metadata", {}).get("name", "Unknown")
+                    data_store[name] = item
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON in {filepath}: {e}")
+    except Exception as e:
+        print(f"Error processing {filepath}: {e}")
+
+
+def load_namespaced_rbac_data_yaml(input_dir_yaml, roles, rolebindings):
+    """
+    Loads Roles and RoleBindings from YAML files, recursively searching for
+    .yaml files, handling both single-object and List-object YAML structures.
+    """
+    for root, _, files in os.walk(input_dir_yaml):
+        for file in files:
+            if file.endswith(".yaml"):  # Process ANY .yaml file
+                filepath = os.path.join(root, file)
+                try:
+                    with open(filepath, 'r') as f:
+                        data = yaml.safe_load(f)
+
+                    if data is None:  # Handle empty YAML files
+                        continue
+
+                    # Handle List objects (like before)
+                    if isinstance(data, dict) and data.get("kind") == "List" and data.get("items"):
+                        for item in data["items"]:
+                            process_yaml_item(item, roles, rolebindings, root, input_dir_yaml)
+                    # Handle single objects (the NEW part)
+                    elif isinstance(data, dict) and data.get("kind") in ("Role", "RoleBinding"):
+                        process_yaml_item(data, roles, rolebindings, root, input_dir_yaml)
+                    # you could add here an else statement to log if there any other kind of object found
+
+                except yaml.YAMLError as e:
+                    print(f"Error parsing YAML in {filepath}: {e}")
+                except Exception as e:
+                    print(f"Error processing {filepath}: {e}")
+
+
+def process_yaml_item(item, roles, rolebindings, root, input_dir_yaml):
+    """Processes a single Role or RoleBinding item from YAML."""
+    if item.get("kind") == "Role":
+        role_name = item["metadata"]["name"]
+        namespace = item["metadata"].get("namespace")
+        # if no namespace get it from the file path
+        if not namespace:
+            relative_path = os.path.relpath(root, input_dir_yaml)
+            if relative_path == ".":
+                namespace = "default"
+            else:
+                namespace = relative_path
+        else:  # Validate existing namespace
+             relative_path = os.path.relpath(root, input_dir_yaml)
+             if relative_path != "." and relative_path != namespace:
+                 print(f"Warning: Role {role_name} has namespace mismatch.  Filepath suggests {relative_path}, metadata says {namespace}")
+
+        if namespace not in roles:
+             roles[namespace] = {}
+        roles[namespace][role_name] = item
+
+    elif item.get("kind") == "RoleBinding":
+        binding_name = item["metadata"]["name"]
+        namespace = item["metadata"].get("namespace")
+        # if no namespace get it from file path
+        if not namespace:
+            relative_path = os.path.relpath(root, input_dir_yaml)
+            if relative_path == ".":
+                namespace = "default"
+            else:
+                namespace = relative_path
+        else:  # Validate existing namespace
+            relative_path = os.path.relpath(root, input_dir_yaml)
+            if relative_path != "." and relative_path != namespace:
+                print(f"Warning: RoleBinding {binding_name} has namespace mismatch.  Filepath suggests {relative_path}, metadata says {namespace}")
+
+        if namespace not in rolebindings:
+            rolebindings[namespace] = {}
+        rolebindings[namespace][binding_name] = item
+
+
+
+def process_clusterrole(role_data, clusterrolebindings, namespaces, csv_data):
+    """Processes a single ClusterRole and its bindings."""
+    role_name = role_data.get("metadata", {}).get("name", "Unknown")
+    rules = role_data.get("rules", [])
+
+    for binding_name, binding_data in clusterrolebindings.items():
+        if binding_data.get("roleRef", {}).get("name") == role_name:
+            subjects = binding_data.get("subjects", [])
+            for subject in subjects:
+                subject_type = subject.get("kind", "Unknown")
+                subject_name = subject.get("name", "Unknown")
+                namespace_context = "Cluster-wide"
+                namespace_name = ""
+
+                if "namespace" in subject:
+                    namespace_name = subject.get("namespace", "")
+                    namespace_context = "Specific Namespace"
+                    if namespace_name not in namespaces:
+                        print(f"Warning: Namespace '{namespace_name}' not found.")
+
+                for rule in rules:
+                    process_rule(rule, "ClusterRole", role_name, subject_type, subject_name, namespace_context, namespace_name, csv_data)
+
+
+def process_role(role_data, rolebindings, csv_data, namespace):
+    """Processes a single Role and its bindings within a namespace."""
+    role_name = role_data.get("metadata", {}).get("name", "Unknown")
+    rules = role_data.get("rules", [])
+
+    for binding_name, binding_data in rolebindings.items():
+        if binding_data.get("roleRef", {}).get("name") == role_name:
+            # Validate namespace consistency
+            binding_namespace = binding_data.get("metadata", {}).get("namespace")
+            if binding_namespace != namespace:
+                print(f"Warning: RoleBinding {binding_name} in namespace {namespace} references a Role, but its metadata.namespace is {binding_namespace}.")
+                continue
+
+            subjects = binding_data.get("subjects", [])
+            for subject in subjects:
+                subject_type = subject.get("kind", "Unknown")
+                subject_name = subject.get("name", "Unknown")
+                namespace_context = "Specific Namespace"  # Always specific for Roles
+                namespace_name = namespace
+
+                for rule in rules:
+                    process_rule(rule, "Role", role_name, subject_type, subject_name, namespace_context, namespace_name, csv_data)
+
+def process_rule(rule, role_type, role_name, subject_type, subject_name, namespace_context, namespace_name, csv_data):
+    """Processes a single RBAC rule (shared by ClusterRoles and Roles)."""
+    api_groups = rule.get("apiGroups", [""])
+    verbs = rule.get("verbs", [])
+    resources = rule.get("resources", [])
+
+    for api_group in api_groups:
+        for verb in verbs:
+            for resource in resources:
+                high_risk = "No"
+                if resource in HIGH_RISK_RESOURCES and verb in HIGH_RISK_VERBS:
+                    high_risk = "Yes"
+                if resource == "*":
+                    high_risk = "Yes"
+                if resource == "nodes/proxy" and verb in ["get", "create", "update", "delete", "patch"]:
+                    high_risk = "Yes"
+                if verb == "impersonate":
+                    high_risk = "Yes"
+
+                csv_data.append([
+                    role_type, role_name, subject_type, subject_name,
+                    namespace_context, namespace_name, api_group,
+                    verb, resource, high_risk
+                ])
+
+def main():
+     # Use input() for interactive prompts
+    input_dir_json = input("Enter the directory path containing the ClusterRole, ClusterRoleBinding, and Namespace JSON files: ")
+    input_dir_yaml = input("Enter the directory path containing the namespaced Role and RoleBinding YAML files (or press Enter to skip): ")
+    output_file = input("Enter the desired output CSV file name (or press Enter for rbac_audit.csv): ")
+
+    # Handle default output file name
+    if not output_file:
+        output_file = "rbac_audit.csv"
+
+    # Handle empty YAML directory input (treat as None)
+    if not input_dir_yaml:
+        input_dir_yaml = None
+
+    audit_rbac_files(input_dir_json, input_dir_yaml, output_file)
+
+
+if __name__ == "__main__":
+    main()
